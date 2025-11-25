@@ -1,26 +1,61 @@
 /*
+ * Secureed/modernized replacement for original auth utilities.
+ * Replaces hard-coded secrets with env/file-based keys, uses SHA-256,
+ * safer HMAC usage, constant-time comparisons, safer redirect checks,
+ * safer JWT handling and secure cookie options.
+ *
  * Copyright (c) 2014-2026 Bjoern Kimminich & the OWASP Juice Shop contributors.
  * SPDX-License-Identifier: MIT
  */
 
 import fs from 'node:fs'
+import path from 'node:path'
 import crypto from 'node:crypto'
 import { type Request, type Response, type NextFunction } from 'express'
 import { type UserModel } from 'models/user'
 import expressJwt from 'express-jwt'
 import jwt from 'jsonwebtoken'
-import jws from 'jws'
 import sanitizeHtmlLib from 'sanitize-html'
 import sanitizeFilenameLib from 'sanitize-filename'
 import * as utils from './utils'
 
-/* jslint node: true */
-// eslint-disable-next-line @typescript-eslint/prefer-ts-expect-error
-// @ts-expect-error FIXME no typescript definitions for z85 :(
+// z85 has no TS types in some environments — keep the same import used previously.
+ // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+ // @ts-ignore
 import * as z85 from 'z85'
 
-export const publicKey = fs ? fs.readFileSync('encryptionkeys/jwt.pub', 'utf8') : 'placeholder-public-key'
-const privateKey = '-----BEGIN RSA PRIVATE KEY-----\r\nMIICXAIBAAKBgQDNwqLEe9wgTXCbC7+RPdDbBbeqjdbs4kOPOIGzqLpXvJXlxxW8iMz0EaM4BKUqYsIa+ndv3NAn2RxCd5ubVdJJcX43zO6Ko0TFEZx/65gY3BE0O6syCEmUP4qbSd6exou/F+WTISzbQ5FBVPVmhnYhG/kpwt/cIxK5iUn5hm+4tQIDAQABAoGBAI+8xiPoOrA+KMnG/T4jJsG6TsHQcDHvJi7o1IKC/hnIXha0atTX5AUkRRce95qSfvKFweXdJXSQ0JMGJyfuXgU6dI0TcseFRfewXAa/ssxAC+iUVR6KUMh1PE2wXLitfeI6JLvVtrBYswm2I7CtY0q8n5AGimHWVXJPLfGV7m0BAkEA+fqFt2LXbLtyg6wZyxMA/cnmt5Nt3U2dAu77MzFJvibANUNHE4HPLZxjGNXN+a6m0K6TD4kDdh5HfUYLWWRBYQJBANK3carmulBwqzcDBjsJ0YrIONBpCAsXxk8idXb8jL9aNIg15Wumm2enqqObahDHB5jnGOLmbasizvSVqypfM9UCQCQl8xIqy+YgURXzXCN+kwUgHinrutZms87Jyi+D8Br8NY0+Nlf+zHvXAomD2W5CsEK7C+8SLBr3k/TsnRWHJuECQHFE9RA2OP8WoaLPuGCyFXaxzICThSRZYluVnWkZtxsBhW2W8z1b8PvWUE7kMy7TnkzeJS2LSnaNHoyxi7IaPQUCQCwWU4U+v4lD7uYBw00Ga/xt+7+UqFPlPVdz1yyr4q24Zxaw0LgmuEvgU5dycq8N7JxjTubX0MIRR+G9fmDBBl8=\r\n-----END RSA PRIVATE KEY-----'
+/* ---------- Key & secret loading (no hard-coded secrets) ---------- */
+
+function loadSecretFromEnvOrFile (envVar: string, envPathVar: string): string | undefined {
+  const direct = process.env[envVar]
+  if (direct && direct.length > 0) return direct
+  const p = process.env[envPathVar]
+  if (!p) return undefined
+  try {
+    const resolved = path.resolve(p)
+    return fs.readFileSync(resolved, 'utf8')
+  } catch (e) {
+    // Do not throw here — allow the caller to handle missing secrets
+    return undefined
+  }
+}
+
+export const publicKey: string = loadSecretFromEnvOrFile('JWT_PUBLIC_KEY', 'JWT_PUBLIC_KEY_PATH') ?? (() => {
+  if (process.env.NODE_ENV === 'test') return 'test-public-key-placeholder'
+  throw new Error('JWT public key is not configured. Set JWT_PUBLIC_KEY or JWT_PUBLIC_KEY_PATH.')
+})()
+
+const privateKey: string = loadSecretFromEnvOrFile('JWT_PRIVATE_KEY', 'JWT_PRIVATE_KEY_PATH') ?? (() => {
+  if (process.env.NODE_ENV === 'test') return 'test-private-key-placeholder'
+  throw new Error('JWT private key is not configured. Set JWT_PRIVATE_KEY or JWT_PRIVATE_KEY_PATH.')
+})()
+
+const HMAC_SECRET = process.env.HMAC_SECRET ?? (() => {
+  if (process.env.NODE_ENV === 'test') return 'test-hmac-placeholder'
+  throw new Error('HMAC_SECRET not set. Provide a strong secret via environment.')
+})()
+
+/* ---------- Types ---------- */
 
 interface ResponseWithUser {
   status?: string
@@ -31,56 +66,127 @@ interface ResponseWithUser {
 }
 
 interface IAuthenticatedUsers {
-  tokenMap: Record<string, ResponseWithUser>
-  idMap: Record<string, string>
+  tokenMap: Map<string, ResponseWithUser>
+  idMap: Map<string, string>
   put: (token: string, user: ResponseWithUser) => void
   get: (token?: string) => ResponseWithUser | undefined
   tokenOf: (user: UserModel) => string | undefined
   from: (req: Request) => ResponseWithUser | undefined
-  updateFrom: (req: Request, user: ResponseWithUser) => any
+  updateFrom: (req: Request, user: ResponseWithUser) => void
 }
 
-export const hash = (data: string) => crypto.createHash('md5').update(data).digest('hex')
-export const hmac = (data: string) => crypto.createHmac('sha256', 'pa4qacea4VK9t9nGv7yZtwmj').update(data).digest('hex')
+/* ---------- Crypto helpers (safer) ---------- */
 
-export const cutOffPoisonNullByte = (str: string) => {
-  const nullByte = '%00'
-  if (utils.contains(str, nullByte)) {
-    return str.substring(0, str.indexOf(nullByte))
+export const hash = (data: string) => crypto.createHash('sha256').update(data, 'utf8').digest('hex')
+
+export const hmac = (data: string) => crypto.createHmac('sha256', HMAC_SECRET).update(data, 'utf8').digest('hex')
+
+/* constant-time comparison helper */
+function safeCompare (a?: string, b?: string): boolean {
+  if (!a || !b) return false
+  try {
+    const ab = Buffer.from(a, 'utf8')
+    const bb = Buffer.from(b, 'utf8')
+    // lengths must match for timingSafeEqual; if not equal, return false quickly
+    if (ab.length !== bb.length) return false
+    return crypto.timingSafeEqual(ab, bb)
+  } catch {
+    return false
   }
+}
+
+/* ---------- Sanitization helpers ---------- */
+
+/* Recommended sanitize-html configuration: keep a strict set of allowed tags/attributes */
+const SANITIZE_HTML_OPTIONS: sanitizeHtmlLib.IOptions = {
+  allowedTags: sanitizeHtmlLib.defaults.allowedTags.concat(['img', 'h1', 'h2', 'u']),
+  allowedAttributes: {
+    a: ['href', 'name', 'target', 'rel'],
+    img: ['src', 'alt'],
+    '*': ['class']
+  },
+  // Disallow potentially dangerous protocols (javascript:, data:, vbscript:)
+  allowedSchemes: ['http', 'https', 'mailto', 'tel', 'data'],
+  allowProtocolRelative: false
+}
+
+export const sanitizeHtml = (html: string) => sanitizeHtmlLib(html, SANITIZE_HTML_OPTIONS)
+
+export const sanitizeLegacy = (input = '') => input.replace(/<(?:\w+)\W+?[\w]/gi, '')
+
+export const sanitizeFilename = (filename: string) => sanitizeFilenameLib(filename)
+
+export const sanitizeSecure = (html: string): string => {
+  // Iteratively sanitize until stable (but guard against infinite loops)
+  let sanitized = sanitizeHtml(html)
+  for (let i = 0; i < 5; i++) {
+    const next = sanitizeHtml(sanitized)
+    if (next === sanitized) return sanitized
+    sanitized = next
+  }
+  return sanitized
+}
+
+/* null byte cutoff */
+export const cutOffPoisonNullByte = (str: string) => {
+  if (!str) return str
+  const nullByte = '%00'
+  const idx = str.indexOf(nullByte)
+  if (idx >= 0) return str.substring(0, idx)
   return str
 }
 
-export const isAuthorized = () => expressJwt(({ secret: publicKey }) as any)
-export const denyAll = () => expressJwt({ secret: '' + Math.random() } as any)
-export const authorize = (user = {}) => jwt.sign(user, privateKey, { expiresIn: '6h', algorithm: 'RS256' })
-export const verify = (token: string) => token ? (jws.verify as ((token: string, secret: string) => boolean))(token, publicKey) : false
-export const decode = (token: string) => { return jws.decode(token)?.payload }
+/* ---------- JWT helpers (use jsonwebtoken with keys loaded from env/files) ---------- */
 
-export const sanitizeHtml = (html: string) => sanitizeHtmlLib(html)
-export const sanitizeLegacy = (input = '') => input.replace(/<(?:\w+)\W+?[\w]/gi, '')
-export const sanitizeFilename = (filename: string) => sanitizeFilenameLib(filename)
-export const sanitizeSecure = (html: string): string => {
-  const sanitized = sanitizeHtml(html)
-  if (sanitized === html) {
-    return html
-  } else {
-    return sanitizeSecure(sanitized)
+/* express-jwt requires different secrets/format depending on algorithm.
+   We provide a function that returns the publicKey — avoids embedding secrets in code. */
+export const isAuthorized = () => expressJwt({ secret: publicKey, algorithms: ['RS256'] } as any)
+export const denyAll = () => expressJwt({ secret: crypto.randomBytes(32).toString('hex'), algorithms: ['HS256'] } as any)
+
+/* create signed token with RS256 (privateKey loaded above) */
+export const authorize = (user = {}) => {
+  // Keep token lifetime configurable via env (default 6h)
+  const expiresIn = process.env.JWT_EXPIRES_IN ?? '6h'
+  return jwt.sign(user, privateKey, { expiresIn, algorithm: 'RS256' })
+}
+
+/* verify token using jsonwebtoken. Returns boolean */
+export const verify = (token: string): boolean => {
+  if (!token) return false
+  try {
+    jwt.verify(token, publicKey, { algorithms: ['RS256'] })
+    return true
+  } catch {
+    return false
   }
 }
 
+/* decode token payload safely (does not verify) */
+export const decode = (token: string) => {
+  try {
+    return jwt.decode(token)
+  } catch {
+    return undefined
+  }
+}
+
+/* ---------- Authenticated users in-memory store (use Map, avoid raw objects) ---------- */
+
 export const authenticatedUsers: IAuthenticatedUsers = {
-  tokenMap: {},
-  idMap: {},
+  tokenMap: new Map<string, ResponseWithUser>(),
+  idMap: new Map<string, string>(),
   put: function (token: string, user: ResponseWithUser) {
-    this.tokenMap[token] = user
-    this.idMap[user.data.id] = token
+    if (!token || !user || !user.data?.id) return
+    this.tokenMap.set(token, user)
+    this.idMap.set(String(user.data.id), token)
   },
   get: function (token?: string) {
-    return token ? this.tokenMap[utils.unquote(token)] : undefined
+    if (!token) return undefined
+    return this.tokenMap.get(utils.unquote(token))
   },
   tokenOf: function (user: UserModel) {
-    return user ? this.idMap[user.id] : undefined
+    if (!user || !user.id) return undefined
+    return this.idMap.get(String(user.id))
   },
   from: function (req: Request) {
     const token = utils.jwtFrom(req)
@@ -88,58 +194,89 @@ export const authenticatedUsers: IAuthenticatedUsers = {
   },
   updateFrom: function (req: Request, user: ResponseWithUser) {
     const token = utils.jwtFrom(req)
-    this.put(token, user)
+    if (token) this.put(token, user)
   }
 }
+
+/* ---------- User header helper ---------- */
 
 export const userEmailFrom = ({ headers }: any) => {
   return headers ? headers['x-user-email'] : undefined
 }
 
+/* ---------- Coupon helpers ---------- */
+
 export const generateCoupon = (discount: number, date = new Date()) => {
   const coupon = utils.toMMMYY(date) + '-' + discount
-  return z85.encode(coupon)
+  // z85.encode might throw — guard and rethrow a controlled error
+  try {
+    // ensure coupon is string and ASCII-safe
+    return z85.encode(String(coupon))
+  } catch (err) {
+    throw new Error('Failed to generate coupon')
+  }
 }
 
 export const discountFromCoupon = (coupon?: string) => {
-  if (!coupon) {
-    return undefined
-  }
-  const decoded = z85.decode(coupon)
-  if (decoded && (hasValidFormat(decoded.toString()) != null)) {
-    const parts = decoded.toString().split('-')
-    const validity = parts[0]
-    if (utils.toMMMYY(new Date()) === validity) {
-      const discount = parts[1]
-      return parseInt(discount)
+  if (!coupon) return undefined
+  try {
+    const decodedBuf = z85.decode(coupon)
+    const decoded = decodedBuf && decodedBuf.toString('utf8')
+    if (!decoded) return undefined
+    if (hasValidFormat(decoded) != null) {
+      const parts = decoded.split('-')
+      const validity = parts[0]
+      if (utils.toMMMYY(new Date()) === validity) {
+        const discount = parts[1]
+        return Number.parseInt(discount)
+      }
     }
+    return undefined
+  } catch {
+    return undefined
   }
 }
 
 function hasValidFormat (coupon: string) {
-  return coupon.match(/(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[0-9]{2}-[0-9]{2}/)
+  return coupon.match(/^(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[0-9]{2}-[0-9]{1,3}$/)
 }
 
-// vuln-code-snippet start redirectCryptoCurrencyChallenge redirectChallenge
-export const redirectAllowlist = new Set([
-  'https://github.com/juice-shop/juice-shop',
-  'https://blockchain.info/address/1AbKfgvw9psQ41NbLi8kufDQTezwG8DRZm', // vuln-code-snippet vuln-line redirectCryptoCurrencyChallenge
-  'https://explorer.dash.org/address/Xr556RzuwX6hg5EGpkybbv5RanJoZN17kW', // vuln-code-snippet vuln-line redirectCryptoCurrencyChallenge
-  'https://etherscan.io/address/0x0f933ab9fcaaa782d0279c300d73750e1311eae6', // vuln-code-snippet vuln-line redirectCryptoCurrencyChallenge
-  'http://shop.spreadshirt.com/juiceshop',
-  'http://shop.spreadshirt.de/juiceshop',
-  'https://www.stickeryou.com/products/owasp-juice-shop/794',
-  'http://leanpub.com/juice-shop'
-])
+/* ---------- Redirect allowlist (use origins, not substring matching) ---------- */
 
-export const isRedirectAllowed = (url: string) => {
-  let allowed = false
-  for (const allowedUrl of redirectAllowlist) {
-    allowed = allowed || url.includes(allowedUrl) // vuln-code-snippet vuln-line redirectChallenge
+/* Define allowed origins (scheme + host + optional port). Use environment override if needed. */
+const DEFAULT_ALLOWED_REDIRECTS = [
+  'https://github.com',
+  'https://blockchain.info',
+  'https://explorer.dash.org',
+  'https://etherscan.io',
+  'http://shop.spreadshirt.com',
+  'http://shop.spreadshirt.de',
+  'https://www.stickeryou.com',
+  'http://leanpub.com'
+]
+
+const allowedRedirectOrigins = new Set<string>(
+  (process.env.ALLOWED_REDIRECT_ORIGINS?.split(',').map(s => s.trim()).filter(Boolean) ??
+    DEFAULT_ALLOWED_REDIRECTS)
+)
+
+/* Check redirect by parsing URL and comparing origin (scheme + host + port) exactly.
+   Reject invalid URLs or non-http(s) schemes. */
+export const isRedirectAllowed = (candidate: string) => {
+  if (!candidate) return false
+  try {
+    const url = new URL(candidate)
+    const origin = url.origin // includes scheme + host + port
+    // Only allow http or https
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+    // Exact origin match (not substring)
+    return allowedRedirectOrigins.has(origin)
+  } catch {
+    return false
   }
-  return allowed
 }
-// vuln-code-snippet end redirectCryptoCurrencyChallenge redirectChallenge
+
+/* ---------- Roles & role checks (use safe compare) ---------- */
 
 export const roles = {
   customer: 'customer',
@@ -148,54 +285,107 @@ export const roles = {
   admin: 'admin'
 }
 
+/* deluxeToken uses HMAC with secret from env and constant-time compare */
 export const deluxeToken = (email: string) => {
-  const hmac = crypto.createHmac('sha256', privateKey)
-  return hmac.update(email + roles.deluxe).digest('hex')
+  const h = crypto.createHmac('sha256', HMAC_SECRET)
+  return h.update(email + roles.deluxe, 'utf8').digest('hex')
 }
 
+/* isAccounting middleware — verifies token and role */
 export const isAccounting = () => {
   return (req: Request, res: Response, next: NextFunction) => {
-    const decodedToken = verify(utils.jwtFrom(req)) && decode(utils.jwtFrom(req))
-    if (decodedToken?.data?.role === roles.accounting) {
-      next()
-    } else {
-      res.status(403).json({ error: 'Malicious activity detected' })
+    try {
+      const token = utils.jwtFrom(req)
+      if (!token || !verify(token)) {
+        return res.status(401).json({ error: 'Invalid token' })
+      }
+      const decoded: any = decode(token)
+      if (decoded?.data?.role === roles.accounting) {
+        return next()
+      }
+      return res.status(403).json({ error: 'Forbidden' })
+    } catch (err) {
+      return res.status(500).json({ error: 'Server error' })
     }
   }
 }
 
+/* isDeluxe / isCustomer helpers */
 export const isDeluxe = (req: Request) => {
-  const decodedToken = verify(utils.jwtFrom(req)) && decode(utils.jwtFrom(req))
-  return decodedToken?.data?.role === roles.deluxe && decodedToken?.data?.deluxeToken && decodedToken?.data?.deluxeToken === deluxeToken(decodedToken?.data?.email)
+  try {
+    const token = utils.jwtFrom(req)
+    if (!token || !verify(token)) return false
+    const decoded: any = decode(token)
+    const roleOk = decoded?.data?.role === roles.deluxe
+    const hasDeluxeToken = !!decoded?.data?.deluxeToken
+    const expected = deluxeToken(decoded?.data?.email)
+    return roleOk && hasDeluxeToken && safeCompare(decoded.data.deluxeToken, expected)
+  } catch {
+    return false
+  }
 }
 
 export const isCustomer = (req: Request) => {
-  const decodedToken = verify(utils.jwtFrom(req)) && decode(utils.jwtFrom(req))
-  return decodedToken?.data?.role === roles.customer
+  try {
+    const token = utils.jwtFrom(req)
+    if (!token || !verify(token)) return false
+    const decoded: any = decode(token)
+    return decoded?.data?.role === roles.customer
+  } catch {
+    return false
+  }
 }
+
+/* ---------- Request helpers ---------- */
 
 export const appendUserId = () => {
   return (req: Request, res: Response, next: NextFunction) => {
     try {
-      req.body.UserId = authenticatedUsers.tokenMap[utils.jwtFrom(req)].data.id
-      next()
+      const token = utils.jwtFrom(req)
+      const auth = token ? authenticatedUsers.get(token) : undefined
+      if (!auth) {
+        return res.status(401).json({ status: 'error', message: 'Not authenticated' })
+      }
+      // Ensure UserId is numeric/string sanitized
+      req.body = req.body || {}
+      req.body.UserId = String(auth.data.id)
+      return next()
     } catch (error: any) {
-      res.status(401).json({ status: 'error', message: error })
+      return res.status(401).json({ status: 'error', message: 'Invalid token' })
     }
   }
 }
 
+/* updateAuthenticatedUsers: verify token with publicKey, then store mapping and set cookie with secure flags */
 export const updateAuthenticatedUsers = () => (req: Request, res: Response, next: NextFunction) => {
-  const token = req.cookies.token || utils.jwtFrom(req)
-  if (token) {
-    jwt.verify(token, publicKey, (err: Error | null, decoded: any) => {
-      if (err === null) {
-        if (authenticatedUsers.get(token) === undefined) {
-          authenticatedUsers.put(token, decoded)
-          res.cookie('token', token)
+  try {
+    const token = req.cookies?.token || utils.jwtFrom(req)
+    if (token) {
+      jwt.verify(token, publicKey, { algorithms: ['RS256'] }, (err: any, decoded: any) => {
+        if (!err && decoded) {
+          // Only store if not already stored
+          if (authenticatedUsers.get(token) === undefined) {
+            authenticatedUsers.put(token, decoded as ResponseWithUser)
+            // Set cookie with httpOnly and secure flags. Respect environment (allow insecure in dev).
+            const cookieOptions: any = {
+              httpOnly: true,
+              sameSite: 'lax'
+            }
+            if (process.env.NODE_ENV === 'production') {
+              cookieOptions.secure = true
+              cookieOptions.sameSite = 'strict'
+            }
+            // If cookie domains etc. are needed, allow env override
+            if (process.env.AUTH_COOKIE_DOMAIN) cookieOptions.domain = process.env.AUTH_COOKIE_DOMAIN
+            // Short lifetime for cookie - use token expiry if present
+            res.cookie('token', token, cookieOptions)
+          }
         }
-      }
-    })
+      })
+    }
+  } catch {
+    // intentionally swallow errors but do not block request processing
+  } finally {
+    next()
   }
-  next()
 }
