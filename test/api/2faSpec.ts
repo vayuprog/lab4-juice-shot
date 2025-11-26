@@ -235,7 +235,7 @@ describe('/rest/2fa/setup', () => {
     const email = 'fooooo1@bar.com'
     const password = '123456'
 
-    const secret = 'ASDVAJSDUASZGDIADBJS'
+    const secret = process.env.TEST_2FA_SECRET
 
     await register({ email, password })
     const { token } = await login({ email, password })
@@ -367,7 +367,7 @@ describe('/rest/2fa/setup', () => {
   it('POST should fail if the account has already set up 2fa', async () => {
     const email = `wurstbrot@${config.get<string>('application.domain')}`
     const password = 'EinBelegtesBrotMitSchinkenSCHINKEN!'
-    const totpSecret = 'IFTXE3SPOEYVURT2MRYGI52TKJ4HC3KH'
+    const totpSecret = process.env.TEST_TOTP_SECRET || config.get<string>('test.totpSecret')
 
     const { token } = await login({ email, password, totpSecret })
 
